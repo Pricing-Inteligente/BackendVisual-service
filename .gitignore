@@ -1,0 +1,16 @@
+# Entornos virtuales
+venv/
+.env
+
+# Archivos de Python
+__pycache__/
+*.pyc
+
+# Archivos de sistema
+.DS_Store
+
+# Node.js (por si usas algo)
+node_modules/
+
+# Otros
+*.log
