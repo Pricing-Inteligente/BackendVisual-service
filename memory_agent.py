@@ -66,7 +66,7 @@ variables_string = df_variables.to_string(index=False)
 
 model = ChatGroq(
     api_key = GROQ_API_KEY,
-    model="openai/gpt-oss-20b"
+    model="openai/gpt-oss-120b"
 )
 
 prompt = ChatPromptTemplate.from_messages(
