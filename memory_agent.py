@@ -66,7 +66,11 @@ variables_string = df_variables.to_string(index=False)
 
 model = ChatGroq(
     api_key = GROQ_API_KEY,
-    model="openai/gpt-oss-120b"
+    model="openai/gpt-oss-120b",
+    # model="deepseek-r1-distill-llama-70b",
+    # model="groq/compound",
+    # model="llama-3.3-70b-versatile",
+    # model="moonshotai/kimi-k2-instruct-0905",
 )
 
 prompt = ChatPromptTemplate.from_messages(
@@ -81,6 +85,11 @@ prompt = ChatPromptTemplate.from_messages(
             "Always use these full dataframes when building visualizations, not just the 5-row sample. "
             "Use only pandas, plotly.express (px), and plotly.graph_objects (go) libraries. "
             "Don't use external libraries like statsmodels or sklearn. "
+            "For density maps, don't use aspect argument. "
+            "For objects, use attributes according to the official documentation. "
+            "Take in mind i use pandas version 2.3.2 and plotly version 5.19.0. "
+            "The code should be inside one single code block ```python ... ```, don't use multiple code blocks. "
+            "This means that you still can write explanations outside the code block, but the code itself should be in one single block. "
             "Follow the user's indications when creating the graph."
         ),
         MessagesPlaceholder(variable_name="messages")
