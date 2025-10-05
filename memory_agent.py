@@ -133,7 +133,7 @@ def get_fig_from_code(code):
 
 app = Dash()
 server = app.server
-CORS(server, resources={r"/*": {"origins": "http://localhost:4200"}})
+CORS(server, resources={r"/*": {"origins": ["http://localhost:4200", "http://localhost:8080", "http://127.0.0.1:8080"]}})
 app.layout = [
     html.H1("Visualizaciones:"),
     # dag.AgGrid(
