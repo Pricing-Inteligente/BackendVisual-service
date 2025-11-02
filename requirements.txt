@@ -2,11 +2,13 @@ dash==3.2.0
 dash_ag_grid==32.3.1
 Flask==3.1.2
 flask_cors==5.0.1
-langchain==1.0.2
-langchain_core==1.0.0
-langchain_groq==1.0.0
+langchain
+langchain_core
+langchain_groq
 pandas==2.3.3
 plotly==5.19.0
 psycopg2_binary==2.9.9
 python-dotenv==1.1.1
 SQLAlchemy==2.0.17
+supabase==2.7.4
+flask-socketio==5.3.6
