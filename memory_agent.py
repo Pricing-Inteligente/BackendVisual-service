@@ -53,12 +53,26 @@ CREATE_MESSAGES_TABLE_ON_START = os.getenv("CREATE_MESSAGES_TABLE_ON_START", "fa
 SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
+# Orígenes permitidos para CORS/Socket.IO (separados por coma en ALLOWED_ORIGINS)
+_default_origins = [
+    "http://localhost:4200",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+ALLOWED_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or ",".join(_default_origins)).split(",") if o.strip()]
+
 productos_string = ""
 variables_string = ""
 
 _base_url = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 DATABASE_URL = f"{_base_url}?sslmode={DB_SSLMODE}" if DB_SSLMODE else _base_url
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+try:
+    connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))
+except Exception:
+    connect_timeout = 5
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": connect_timeout})
 
 # Cliente Supabase opcional (si hay credenciales)
 # Cliente supabase (evitamos anotación para compatibilidad si el tipo no está disponible)
@@ -102,13 +116,20 @@ def fetch_table(table_name: str, limit: int = None):
         print(f"Error fetching data from {table_name}: {e}")
         return pd.DataFrame()
 
-# Sample 5 rows for the model to understand the data structure
-df_productos = fetch_table(DB_PRODS, 5)
-df_variables = fetch_table(DB_VARS, 5)
+SKIP_DB_ON_START = (os.getenv("SKIP_DB_ON_START", "false").lower() == "true")
+if SKIP_DB_ON_START:
+    df_productos = pd.DataFrame()
+    df_variables = pd.DataFrame()
+    df_productos_all = pd.DataFrame()
+    df_variables_all = pd.DataFrame()
+else:
+    # Sample 5 rows for the model to understand the data structure
+    df_productos = fetch_table(DB_PRODS, 5)
+    df_variables = fetch_table(DB_VARS, 5)
 
-# All rows from PostgreSQL
-df_productos_all = fetch_table(DB_PRODS)
-df_variables_all = fetch_table(DB_VARS)
+    # All rows from PostgreSQL
+    df_productos_all = fetch_table(DB_PRODS)
+    df_variables_all = fetch_table(DB_VARS)
 
 def smart_cast_numeric(series: pd.Series) -> pd.Series:
     """
@@ -208,6 +229,96 @@ prompt = ChatPromptTemplate.from_messages(
 
 chain = prompt | model
 
+def _sanitize_code(code: str) -> str:
+    """
+    Limpia restos de markdown, comillas tipográficas, zero-width chars y elimina llamadas .show().
+    """
+    s = code.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.lstrip("\ufeff").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    lines = s.split("\n")
+    cleaned_lines = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.lower() in ("<code>", "</code>"):
+            continue
+        if i == 0 and stripped.lower() == "python":
+            continue
+        cleaned_lines.append(line)
+    s = "\n".join(cleaned_lines)
+    s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+    s = re.sub(r"(?m)^\s*\w+\.show\(\)\s*$", "", s)
+    return s.strip()
+
+def _parse_viz_prompt(viz_prompt: str) -> dict:
+    """
+    Extrae un 'especificación' simple desde un VIZ_PROMPT en texto natural.
+    Busca:
+      - Título entre comillas después de "titulada '...'/\"...\"" (opcional)
+      - Campos de ejes "Eje X: '...'" y "Eje Y: '...'" (opcionales; por defecto label/value)
+      - El bloque Datos (JSON): [...]
+    Devuelve {'title', 'x_key', 'y_key', 'data'} o lanza ValueError si no encuentra datos.
+    """
+    s = viz_prompt or ""
+    # Título
+    title = None
+    m = re.search(r"titulada\s+['\"]([^'\"]+)['\"]", s, re.IGNORECASE)
+    if m:
+        title = m.group(1).strip()
+    # Ejes
+    x_key, y_key = "label", "value"
+    mx = re.search(r"Eje\s+X\s*:\s*['\"]([^'\"]+)['\"]", s, re.IGNORECASE)
+    my = re.search(r"Eje\s*Y\s*:\s*['\"]([^'\"]+)['\"]", s, re.IGNORECASE)
+    if mx: x_key = mx.group(1).strip()
+    if my: y_key = my.group(1).strip()
+    # Datos JSON
+    dm = re.search(r"Datos\s*\(JSON\)\s*:\s*(\[.*\])\s*$", s, re.IGNORECASE | re.DOTALL)
+    if not dm:
+        # También intentar capturar hasta el fin del paréntesis si viene texto después
+        dm = re.search(r"Datos\s*\(JSON\)\s*:\s*(\[.*?\])", s, re.IGNORECASE | re.DOTALL)
+    if not dm:
+        raise ValueError("No se encontró bloque de datos JSON en el VIZ_PROMPT")
+    data_str = dm.group(1)
+    try:
+        data = json.loads(data_str)
+        if not isinstance(data, list) or not data:
+            raise ValueError("Datos JSON vacíos o inválidos")
+    except Exception as e:
+        raise ValueError(f"JSON inválido en VIZ_PROMPT: {e}")
+    return {"title": title or "Gráfico", "x_key": x_key, "y_key": y_key, "data": data}
+
+def _code_from_viz_prompt(viz_prompt: str) -> str:
+    """
+    Genera un código Plotly determinista a partir del VIZ_PROMPT (sin imports).
+    El código define una única figura `fig` (px.bar) usando los datos del prompt.
+    """
+    spec = _parse_viz_prompt(viz_prompt)
+    # Embebe los datos como literal Python seguro (via json.dumps y luego eval por python será válido)
+    data_literal = json.dumps(spec["data"], ensure_ascii=False)
+    title_literal = json.dumps(spec["title"], ensure_ascii=False)
+    x_key = spec["x_key"]
+    y_key = spec["y_key"]
+    # Construimos un hovertemplate que muestre algunos campos si existen
+    hover_cols = ["currency", "store", "brand", "country", "min", "max"]
+    hover_list_literal = json.dumps(hover_cols)
+    code = f"""
+import pandas as _pd_tmp
+_df = _pd_tmp.DataFrame({data_literal})
+_x = {json.dumps(x_key)} if {json.dumps(x_key)} in _df.columns else 'label'
+_y = {json.dumps(y_key)} if {json.dumps(y_key)} in _df.columns else 'value'
+fig = px.bar(_df, x=_x, y=_y, title={title_literal})
+# Hover enriquecido (si existen columnas)
+_cols = {hover_list_literal}
+_present = [c for c in _cols if c in _df.columns]
+if _present:
+    _df['_hover'] = _df[_present].astype(str).agg(' | '.join, axis=1)
+    # Evitamos definir hovertemplate explícito para no interferir; dejamos customdata disponible
+    fig.update_traces(customdata=_df['_hover'])
+fig.update_layout(template='plotly_white')
+"""
+    # Quitar imports temporales si se cuelan en sanitize; el entorno ya tiene pd/px/go
+    code = re.sub(r"(?m)^\s*import\s+pandas\s+as\s+_pd_tmp\s*$", "import pandas as _pd_tmp", code)
+    return _sanitize_code(code)
+
 def get_fig_from_code(code):
     local_variables = {
         "df_productos_all": df_productos_all,
@@ -217,8 +328,19 @@ def get_fig_from_code(code):
         "go": go
     }
     try:
-        # exec(code, {}, local_variables)
-        exec(code, local_variables, local_variables)
+        cleaned = _sanitize_code(code)
+        compiled = compile(cleaned, "<string>", "exec")
+        exec(compiled, local_variables, local_variables)
+    except SyntaxError as e:
+        bad_line = ""
+        try:
+            bad_line = cleaned.splitlines()[e.lineno - 1] if e.lineno else ""
+        except Exception:
+            pass
+        return go.Figure().add_annotation(
+            text=f"⚠️ SyntaxError: {e.msg} en línea {e.lineno}. {bad_line}",
+            showarrow=False
+        )
     except Exception as e:
         return go.Figure().add_annotation(
             text=f"⚠️ Error en el código generado: {e}",
@@ -244,11 +366,12 @@ def get_fig_from_code(code):
 
 app = Dash()
 server = app.server
-CORS(server, resources={r"/*": {"origins": ["http://localhost:4200", "http://localhost:8080", "http://127.0.0.1:8080"]}})
+# CORS configurable para desarrollo
+CORS(server, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 # Socket.IO para WebSocket bidireccional
 socketio = SocketIO(
     server,
-    cors_allowed_origins=["http://localhost:4200", "http://localhost:8080", "http://127.0.0.1:8080"],
+    cors_allowed_origins=ALLOWED_ORIGINS,
     async_mode="threading",
 )
 app.layout = [
@@ -342,11 +465,14 @@ def _extract_code_block(possible_code: str) -> str:
     devuelve solo el código, limpiando llamadas *.show().
     Si no hay bloque, asume que todo el string es código y lo limpia.
     """
-    match = re.search(r"```(?:[Pp]ython)?(.*?)```", possible_code, re.DOTALL)
-    code = match.group(1).strip() if match else possible_code.strip()
-    # remover llamadas a .show() en cualquier variable/objeto
-    cleaned = re.sub(r"(?m)^\s*\w+\.show\(\)\s*$", "", code)
-    return cleaned
+    # Capturar todos los bloques y elegir el más probable
+    matches = re.findall(r"```(?:[Pp]ython|py)?\s*(.*?)```", possible_code, re.DOTALL)
+    if matches:
+        candidates = sorted(matches, key=lambda s: (("fig" in s) or ("go.Figure" in s)), reverse=True)
+        code = candidates[0].strip()
+    else:
+        code = possible_code.strip()
+    return _sanitize_code(code)
 
 
 def _insert_message_visualizacion(visualizacion_code: str, text_content: Optional[str] = None) -> int:
@@ -358,14 +484,16 @@ def _insert_message_visualizacion(visualizacion_code: str, text_content: Optiona
     # Si hay cliente supabase configurado, usarlo para insertar
     if supabase is not None:
         try:
-            payload = {"visualizacion": visualizacion_code}
-            # si existe columna de texto opcional
+            payload = {"visualizacion": _sanitize_code(visualizacion_code)}
             if text_content is not None:
                 payload.update({"texto": text_content})
-            insert_res = supabase.table(DB_MESSAGES).insert(payload).select("id").execute()
-            if insert_res.data and len(insert_res.data) > 0 and "id" in insert_res.data[0]:
+            # Supabase-py v2: usar returning="representation" en insert, sin .select()
+            insert_res = supabase.table(DB_MESSAGES).insert(
+                payload,
+                returning="representation",
+            ).execute()
+            if insert_res.data and isinstance(insert_res.data, list) and "id" in insert_res.data[0]:
                 return int(insert_res.data[0]["id"])  # type: ignore
-            # si el provider no devuelve id, intentar un select último (no ideal). Mejor exigir RETURNING id.
             raise RuntimeError("Supabase no devolvió id en inserción")
         except Exception as e:
             raise RuntimeError(f"Error insertando en Supabase: {e}")
@@ -381,7 +509,7 @@ def _insert_message_visualizacion(visualizacion_code: str, text_content: Optiona
                     VALUES (:visualizacion)
                     RETURNING id
                 """),
-                {"visualizacion": visualizacion_code},
+                {"visualizacion": _sanitize_code(visualizacion_code)},
             )
             new_id = res.scalar_one()
             return int(new_id)
@@ -396,7 +524,7 @@ def _insert_message_visualizacion(visualizacion_code: str, text_content: Optiona
                             VALUES (:visualizacion, :contenido)
                             RETURNING id
                         """),
-                        {"visualizacion": visualizacion_code, "contenido": text_content or ""},
+                        {"visualizacion": _sanitize_code(visualizacion_code), "contenido": text_content or ""},
                     )
                     new_id = res.scalar_one()
                     return int(new_id)
@@ -438,11 +566,17 @@ def create_message():
     """
     payload = request.get_json(silent=True) or {}
     visualizacion_code = payload.get("visualizacion_code")
+    viz_prompt = payload.get("viz_prompt") or payload.get("VIZ_PROMPT") or None
     user_text = payload.get("text")
     query = payload.get("query")
 
     # Si no viene el código, generarlo con la cadena (compatibilidad con /generate-graph)
-    if not visualizacion_code and query:
+    if not visualizacion_code and viz_prompt:
+        try:
+            visualizacion_code = _code_from_viz_prompt(viz_prompt)
+        except Exception as e:
+            return jsonify({"error": f"VIZ_PROMPT inválido: {e}"}), 400
+    elif not visualizacion_code and query:
         response = chain.invoke(
             {
                 "messages": [HumanMessage(content=query)],
@@ -474,20 +608,122 @@ def create_message():
     return jsonify(payload), 201
 
 
+@server.route("/api/viz-prompt", methods=["POST"])
+def api_viz_prompt():
+    """
+    Convierte un VIZ_PROMPT (texto) en una figura Plotly JSON.
+    Entrada JSON: { "viz_prompt": "...", "persist": true|false, "text": "opcional" }
+    Si persist=true (por defecto), guarda el código generado y devuelve { msg_id, figure_id } además del fig.
+    """
+    payload = request.get_json(silent=True) or {}
+    viz_prompt = payload.get("viz_prompt") or payload.get("VIZ_PROMPT")
+    if not viz_prompt:
+        return jsonify({"error": "Falta 'viz_prompt'"}), 400
+    try:
+        code = _code_from_viz_prompt(viz_prompt)
+        fig = get_fig_from_code(code)
+        fig_json = json.dumps(fig, cls=PlotlyJSONEncoder)
+    except Exception as e:
+        return jsonify({"error": f"No se pudo generar figura desde VIZ_PROMPT: {e}"}), 400
+
+    if str(payload.get("persist", "true")).lower() == "true":
+        try:
+            new_id = _insert_message_visualizacion(code, text_content=payload.get("text"))
+        except Exception as e:
+            return jsonify({"error": f"No se pudo insertar en {DB_MESSAGES}: {e}"}), 500
+        return fig_json, 201, {"Content-Type": "application/json", "X-Figure-Id": str(new_id)}
+
+    return fig_json, 200, {"Content-Type": "application/json"}
+
+
 @server.route("/api/figures/<int:message_id>", methods=["GET"])
 def serve_figure(message_id: int):
     """
     Devuelve el JSON Plotly de la figura asociada al message_id.
     Lee el código desde la columna 'visualizacion' y lo evalúa de forma controlada.
     """
-    code = _get_visualizacion_code_by_id(message_id)
-    if not code:
+    raw = _get_visualizacion_code_by_id(message_id)
+    if not raw:
         return jsonify({"error": "Figura no encontrada"}), 404
+
+    # Si lo almacenado es un VIZ_PROMPT, conviértelo a código primero
+    s = (raw or "").strip()
+    is_viz_prompt = bool(re.search(r"Datos\s*\(JSON\)\s*:\s*\[", s, re.IGNORECASE))
+    code = _code_from_viz_prompt(s) if is_viz_prompt else s
 
     cleaned = _extract_code_block(code)
     fig = get_fig_from_code(cleaned)
     fig_json = json.dumps(fig, cls=PlotlyJSONEncoder)
     return fig_json, 200, {"Content-Type": "application/json"}
+
+
+@server.route("/api/figures/<int:message_id>/code", methods=["GET"])
+def serve_figure_code(message_id: int):
+    """
+    Devuelve el código limpio que se evalúa para generar la figura (para depuración).
+    """
+    raw = _get_visualizacion_code_by_id(message_id)
+    if not raw:
+        return jsonify({"error": "Figura no encontrada"}), 404
+    s = (raw or "").strip()
+    is_viz_prompt = bool(re.search(r"Datos\s*\(JSON\)\s*:\s*\[", s, re.IGNORECASE))
+    code = _code_from_viz_prompt(s) if is_viz_prompt else s
+    cleaned = _extract_code_block(code)
+    return jsonify({"id": message_id, "code": cleaned, "length": len(cleaned)})
+
+@server.route("/api/messages/recent", methods=["GET"])
+def list_recent_messages():
+    """
+    Lista los últimos mensajes guardados con su id y algunos metadatos.
+    Query param: ?limit=5
+    """
+    try:
+        limit = int(request.args.get("limit", 5))
+        limit = max(1, min(limit, 50))
+    except Exception:
+        limit = 5
+
+    rows = []
+    if supabase is not None:
+        try:
+            res = (
+                supabase
+                .table(DB_MESSAGES)
+                .select("id, created_at, visualizacion")
+                .order("id", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            data = res.data or []
+            for r in data:
+                rows.append({
+                    "id": r.get("id"),
+                    "created_at": r.get("created_at"),
+                    "code_len": len(r.get("visualizacion") or ""),
+                })
+            return jsonify({"items": rows, "count": len(rows)}), 200
+        except Exception as e:
+            print(f"[supabase] Error listando recientes: {e}")
+
+    # Fallback Postgres directo
+    full_table = f"{DB_SCHEMA}.{DB_MESSAGES}"
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text(f"""
+                SELECT id, created_at, visualizacion
+                FROM {full_table}
+                ORDER BY id DESC
+                LIMIT :limit
+            """), {"limit": limit})
+            for r in res.mappings():
+                rows.append({
+                    "id": r.get("id"),
+                    "created_at": r.get("created_at"),
+                    "code_len": len(r.get("visualizacion") or ""),
+                })
+        return jsonify({"items": rows, "count": len(rows)}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @server.route("/health/db", methods=["GET"])
@@ -536,7 +772,11 @@ def _maybe_create_messages_table():
 def run_memory_agent():
     _maybe_create_messages_table()
     # Ejecutar con Socket.IO para habilitar WebSockets
-    socketio.run(server, debug=False, port=8007)
+    try:
+        port = int(os.getenv("PORT", "8007"))
+    except Exception:
+        port = 8007
+    socketio.run(server, debug=False, port=port)
 
 if __name__ == "__main__":
     run_memory_agent()
@@ -560,10 +800,17 @@ def ws_user_message(data):
     """
     try:
         visualizacion_code = data.get("visualizacion_code") if isinstance(data, dict) else None
+        viz_prompt = data.get("viz_prompt") if isinstance(data, dict) else None
         user_text = data.get("text") if isinstance(data, dict) else None
         query = data.get("query") if isinstance(data, dict) else None
 
-        if not visualizacion_code and query:
+        if not visualizacion_code and viz_prompt:
+            try:
+                visualizacion_code = _code_from_viz_prompt(viz_prompt)
+            except Exception as e:
+                emit("error", {"error": f"VIZ_PROMPT inválido: {e}"})
+                return
+        elif not visualizacion_code and query:
             response = chain.invoke(
                 {
                     "messages": [HumanMessage(content=query)],
