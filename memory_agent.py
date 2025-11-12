@@ -348,14 +348,17 @@ def _maybe_update_message_code(message_id: int, new_code: str) -> None:
     except Exception:
         pass
 
-def get_fig_from_code(code):
+def get_fig_from_code(code, allow_dataframes: bool = True):
     local_variables = {
-        "df_productos_all": df_productos_all,
-        "df_variables_all": df_variables_all,
         "px": px,
         "pd": pd,
         "go": go
     }
+    if allow_dataframes:
+        local_variables.update({
+            "df_productos_all": df_productos_all,
+            "df_variables_all": df_variables_all,
+        })
     try:
         cleaned = _sanitize_code(code)
         compiled = compile(cleaned, "<string>", "exec")
@@ -390,6 +393,85 @@ def get_fig_from_code(code):
         text="⚠️ No se encontró ninguna figura en el código generado.",
         showarrow=False
     )
+
+
+def _is_lasso_prompt(text: str) -> bool:
+    t = (text or "").lower()
+    return ("lasso" in t) or ("descompos" in t and "precio" in t)
+
+
+def _extract_first_json_array(s: str) -> list:
+    """
+    Busca el primer array JSON en el texto y lo devuelve como lista de dicts.
+    Es tolerante a texto alrededor. Lanza ValueError si no encuentra ninguno.
+    """
+    # Preferir patrón Datos (JSON): [...]
+    m = re.search(r"Datos\s*\(JSON\)\s*:\s*(\[.*?\])", s, re.IGNORECASE | re.DOTALL)
+    if not m:
+        # Buscar cualquier [ ... ] razonable
+        m = re.search(r"(\[\s*\{.*?\}\s*\])", s, re.DOTALL)
+    if not m:
+        raise ValueError("No se encontró ningún array JSON en el prompt")
+    data_str = m.group(1)
+    data = json.loads(data_str)
+    if not isinstance(data, list) or not data:
+        raise ValueError("Array JSON vacío o inválido")
+    return data
+
+
+def _code_from_lasso_prompt(text: str) -> str:
+    """
+    Genera código Plotly que usa EXCLUSIVAMENTE los datos embebidos en el prompt LASSO.
+    Reglas simples: si hay 'feature'/'coef' o 'value'/'label', usa barras ordenadas por valor abs.
+    Si hay 'time' y 'value', usa línea.
+    """
+    data = _extract_first_json_array(text)
+    title = None
+    mt = re.search(r"titulad[oa]\s+['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
+    if mt:
+        title = mt.group(1).strip()
+    # Detectar columnas
+    keys = set()
+    for d in data[:5]:
+        if isinstance(d, dict):
+            keys.update(d.keys())
+    # Normalizar nombres típicos
+    label_key = 'label' if 'label' in keys else ('feature' if 'feature' in keys else None)
+    value_key = 'value' if 'value' in keys else ('coef' if 'coef' in keys else ('weight' if 'weight' in keys else None))
+    time_key = 'time' if 'time' in keys else ('date' if 'date' in keys else None)
+    title_literal = json.dumps(title or "LASSO", ensure_ascii=False)
+    data_literal = json.dumps(data, ensure_ascii=False)
+    if time_key and value_key:
+        code = f"""
+import pandas as _pd_tmp
+_df = _pd_tmp.DataFrame({data_literal})
+fig = px.line(_df, x={json.dumps(time_key)}, y={json.dumps(value_key)}, title={title_literal})
+fig.update_layout(template='plotly_white')
+"""
+    elif label_key and value_key:
+        code = f"""
+import pandas as _pd_tmp
+_df = _pd_tmp.DataFrame({data_literal})
+_df = _df.dropna(subset=[{json.dumps(value_key)}])
+_df['_abs_'] = _df[{json.dumps(value_key)}].abs()
+_df = _df.sort_values('_abs_', ascending=False)
+fig = px.bar(_df, x={json.dumps(label_key)}, y={json.dumps(value_key)}, title={title_literal})
+fig.update_layout(template='plotly_white')
+"""
+    else:
+        # Fallback: tabla en barras por el primer numérico encontrado
+        num_key = None
+        for k in ['coef','weight','value','avg','mean','y','x']:
+            if k in keys:
+                num_key = k; break
+        lbl_key = label_key or 'label'
+        code = f"""
+import pandas as _pd_tmp
+_df = _pd_tmp.DataFrame({data_literal})
+fig = px.bar(_df, x={json.dumps(lbl_key)}, y={json.dumps(num_key or 'value')}, title={title_literal})
+fig.update_layout(template='plotly_white')
+"""
+    return _sanitize_code(code)
 
 
 
@@ -675,8 +757,20 @@ def serve_figure(message_id: int):
     if not raw:
         return jsonify({"error": "Figura no encontrada"}), 404
 
-    # Si lo almacenado es un VIZ_PROMPT, conviértelo a código primero
+    # Si es un caso LASSO, usa solo los datos embebidos y modo estricto (sin dataframes externos)
     s = (raw or "").strip()
+    if _is_lasso_prompt(s):
+        try:
+            code = _code_from_lasso_prompt(s)
+            _maybe_update_message_code(message_id, code)
+            cleaned = _extract_code_block(code)
+            fig = get_fig_from_code(cleaned, allow_dataframes=False)
+            return json.dumps(fig, cls=PlotlyJSONEncoder), 200, {"Content-Type": "application/json"}
+        except Exception as e:
+            fig = go.Figure().add_annotation(text=f"⚠️ LASSO: datos inválidos o ausentes: {e}", showarrow=False)
+            return json.dumps(fig, cls=PlotlyJSONEncoder), 200, {"Content-Type": "application/json"}
+
+    # Si lo almacenado es un VIZ_PROMPT, conviértelo a código primero
     is_viz_prompt = bool(re.search(r"Datos\s*\(JSON\)\s*:\s*\[", s, re.IGNORECASE))
     code = None
     if is_viz_prompt:
@@ -714,6 +808,13 @@ def serve_figure_code(message_id: int):
     if not raw:
         return jsonify({"error": "Figura no encontrada"}), 404
     s = (raw or "").strip()
+    if _is_lasso_prompt(s):
+        try:
+            code = _code_from_lasso_prompt(s)
+            cleaned = _extract_code_block(code)
+            return jsonify({"id": message_id, "code": cleaned, "length": len(cleaned), "strict": True})
+        except Exception as e:
+            return jsonify({"id": message_id, "error": f"LASSO inválido: {e}"}), 400
     is_viz_prompt = bool(re.search(r"Datos\s*\(JSON\)\s*:\s*\[", s, re.IGNORECASE))
     if is_viz_prompt:
         try:
