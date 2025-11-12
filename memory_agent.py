@@ -319,6 +319,35 @@ fig.update_layout(template='plotly_white')
     code = re.sub(r"(?m)^\s*import\s+pandas\s+as\s+_pd_tmp\s*$", "import pandas as _pd_tmp", code)
     return _sanitize_code(code)
 
+def _code_from_query(query: str) -> str:
+    """
+    Genera código Plotly (en un único bloque con fig) usando el LLM, dado un prompt NL.
+    """
+    response = chain.invoke(
+        {
+            "messages": [HumanMessage(content=query)],
+            "productos_string": productos_string,
+            "variables_string": variables_string,
+        }
+    )
+    result_output = response.content or ""
+    code = _extract_code_block(result_output)
+    if not code.strip():
+        raise ValueError("El LLM no pudo generar código de visualización")
+    return code
+
+def _maybe_update_message_code(message_id: int, new_code: str) -> None:
+    """
+    Si es posible, actualiza la fila en la tabla de mensajes para que 'visualizacion'
+    contenga el código ya generado (evita regenerar en cada GET). Ignora errores.
+    """
+    if supabase is None:
+        return
+    try:
+        supabase.table(DB_MESSAGES).update({"visualizacion": _sanitize_code(new_code)}).eq("id", message_id).execute()
+    except Exception:
+        pass
+
 def get_fig_from_code(code):
     local_variables = {
         "df_productos_all": df_productos_all,
@@ -375,7 +404,7 @@ socketio = SocketIO(
     async_mode="threading",
 )
 app.layout = [
-    html.H1("Visualizaciones:"),
+    html.H1("SPI - Visualizaciones dinamicas:"),
     # dag.AgGrid(
     #     rowData=df_productos_all.to_dict('records'),
     #     columnDefs=[{"field": i} for i in df_productos_all.columns],
@@ -649,9 +678,28 @@ def serve_figure(message_id: int):
     # Si lo almacenado es un VIZ_PROMPT, conviértelo a código primero
     s = (raw or "").strip()
     is_viz_prompt = bool(re.search(r"Datos\s*\(JSON\)\s*:\s*\[", s, re.IGNORECASE))
-    code = _code_from_viz_prompt(s) if is_viz_prompt else s
+    code = None
+    if is_viz_prompt:
+        try:
+            code = _code_from_viz_prompt(s)
+            _maybe_update_message_code(message_id, code)
+        except Exception as e:
+            fig = go.Figure().add_annotation(text=f"⚠️ VIZ_PROMPT inválido: {e}", showarrow=False)
+            return json.dumps(fig, cls=PlotlyJSONEncoder), 200, {"Content-Type": "application/json"}
+    else:
+        # Heurística: si parece código (tiene "fig =" o backticks) úsalo tal cual; si no, trátalo como NL/query
+        looks_like_code = ("fig =" in s) or ("```" in s) or ("px." in s) or ("go.Figure" in s)
+        if looks_like_code:
+            code = s
+        else:
+            try:
+                code = _code_from_query(s)
+                _maybe_update_message_code(message_id, code)
+            except Exception as e:
+                fig = go.Figure().add_annotation(text=f"⚠️ No se pudo generar código desde el prompt: {e}", showarrow=False)
+                return json.dumps(fig, cls=PlotlyJSONEncoder), 200, {"Content-Type": "application/json"}
 
-    cleaned = _extract_code_block(code)
+    cleaned = _extract_code_block(code or "")
     fig = get_fig_from_code(cleaned)
     fig_json = json.dumps(fig, cls=PlotlyJSONEncoder)
     return fig_json, 200, {"Content-Type": "application/json"}
@@ -667,8 +715,21 @@ def serve_figure_code(message_id: int):
         return jsonify({"error": "Figura no encontrada"}), 404
     s = (raw or "").strip()
     is_viz_prompt = bool(re.search(r"Datos\s*\(JSON\)\s*:\s*\[", s, re.IGNORECASE))
-    code = _code_from_viz_prompt(s) if is_viz_prompt else s
-    cleaned = _extract_code_block(code)
+    if is_viz_prompt:
+        try:
+            code = _code_from_viz_prompt(s)
+        except Exception as e:
+            return jsonify({"id": message_id, "error": f"VIZ_PROMPT inválido: {e}"}), 400
+    else:
+        looks_like_code = ("fig =" in s) or ("```" in s) or ("px." in s) or ("go.Figure" in s)
+        if looks_like_code:
+            code = s
+        else:
+            try:
+                code = _code_from_query(s)
+            except Exception as e:
+                return jsonify({"id": message_id, "error": f"No se pudo generar código desde el prompt: {e}"}), 400
+    cleaned = _extract_code_block(code or "")
     return jsonify({"id": message_id, "code": cleaned, "length": len(cleaned)})
 
 @server.route("/api/messages/recent", methods=["GET"])
