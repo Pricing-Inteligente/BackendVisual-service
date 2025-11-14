@@ -222,6 +222,7 @@ prompt = ChatPromptTemplate.from_messages(
             "The code should be inside one single code block ```python ... ```, don't use multiple code blocks. "
             "This means that you still can write explanations outside the code block, but the code itself should be in one single block. "
             "Follow the user's indications when creating the graph."
+            "If the text to be visualized includes in the text LASSO or similar, only use data from the user text, don't use data bases."
         ),
         MessagesPlaceholder(variable_name="messages")
     ]
@@ -711,7 +712,7 @@ def create_message():
     payload = {"msg_id": new_id, "figure_id": new_id, "text": user_text}
     # Notificar a clientes WebSocket que hay un nuevo mensaje listo para renderizar
     try:
-        socketio.emit("new_message", payload, broadcast=True)
+        socketio.emit("new_message", payload)
     except Exception as e:
         print(f"[socketio] No se pudo emitir new_message: {e}")
 
