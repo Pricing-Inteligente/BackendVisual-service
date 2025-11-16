@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  backendvisual:
+    build:
+      context: .
+    container_name: backendvisual
+    env_file:
+      - .env
+    ports:
+      - "8007:8007"
+    restart: unless-stopped
+
