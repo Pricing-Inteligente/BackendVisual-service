@@ -20,12 +20,12 @@ from plotly.utils import PlotlyJSONEncoder
 
 from sqlalchemy import create_engine, text
 
-# Supabase client (opcional, para guardar mensajes via REST)
+# para guardar mensajes via REST
 try:
     from supabase import create_client, Client as SupabaseClient
-except Exception:  # paquete no instalado o no disponible
-    SupabaseClient = None  # type: ignore
-    def create_client(*args, **kwargs):  # type: ignore
+except Exception:
+    SupabaseClient = None
+    def create_client(*args, **kwargs):
         raise RuntimeError("Supabase client no disponible. Instala el paquete 'supabase'.")
 
 dotenv_path = find_dotenv()
@@ -74,7 +74,7 @@ except Exception:
     connect_timeout = 5
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": connect_timeout})
 
-# Cliente Supabase opcional (si hay credenciales)
+
 # Cliente supabase (evitamos anotación para compatibilidad si el tipo no está disponible)
 supabase = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SupabaseClient is not None:
@@ -260,12 +260,10 @@ def _parse_viz_prompt(viz_prompt: str) -> dict:
     Devuelve {'title', 'x_key', 'y_key', 'data'} o lanza ValueError si no encuentra datos.
     """
     s = viz_prompt or ""
-    # Título
     title = None
     m = re.search(r"titulada\s+['\"]([^'\"]+)['\"]", s, re.IGNORECASE)
     if m:
         title = m.group(1).strip()
-    # Ejes
     x_key, y_key = "label", "value"
     mx = re.search(r"Eje\s+X\s*:\s*['\"]([^'\"]+)['\"]", s, re.IGNORECASE)
     my = re.search(r"Eje\s*Y\s*:\s*['\"]([^'\"]+)['\"]", s, re.IGNORECASE)
@@ -396,7 +394,6 @@ def get_fig_from_code(code):
 
 app = Dash()
 server = app.server
-# CORS configurable para desarrollo
 CORS(server, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 # Socket.IO para WebSocket bidireccional
 socketio = SocketIO(
@@ -517,7 +514,6 @@ def _insert_message_visualizacion(visualizacion_code: str, text_content: Optiona
             payload = {"visualizacion": _sanitize_code(visualizacion_code)}
             if text_content is not None:
                 payload.update({"texto": text_content})
-            # Supabase-py v2: usar returning="representation" en insert, sin .select()
             insert_res = supabase.table(DB_MESSAGES).insert(
                 payload,
                 returning="representation",
@@ -570,7 +566,7 @@ def _get_visualizacion_code_by_id(message_id: int) -> Optional[str]:
         try:
             res = supabase.table(DB_MESSAGES).select("visualizacion").eq("id", message_id).single().execute()
             if res.data and "visualizacion" in res.data:
-                return res.data["visualizacion"]  # type: ignore
+                return res.data["visualizacion"]
             return None
         except Exception as e:
             # Fallback a Postgres directo si falla
@@ -827,7 +823,6 @@ def _maybe_create_messages_table():
                 )
             """))
     except Exception as e:
-        # No interrumpir el arranque si falla
         print(f"[setup] No se pudo crear {full_table}: {e}")
 
 
